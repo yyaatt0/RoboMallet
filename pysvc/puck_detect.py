@@ -7,8 +7,14 @@ MIN_R = 30
 MAX_R = 60
 SCALE = 0.5
 INV_SCALE = 1.0 / SCALE
-MIN_CONFIDENCE = 0.45
+MIN_CONFIDENCE = 0.50
 NUM_SAMPLE_PTS = 36
+
+# HSV red ranges — red wraps around 0/180 in OpenCV HSV
+RED_LOWER1 = np.array([0,   100,  60], dtype=np.uint8)
+RED_UPPER1 = np.array([10,  255, 255], dtype=np.uint8)
+RED_LOWER2 = np.array([165, 100,  60], dtype=np.uint8)
+RED_UPPER2 = np.array([180, 255, 255], dtype=np.uint8)
 
 
 def validate_circle(edges, cx, cy, cr):
@@ -55,16 +61,9 @@ def detect_hough(small_blur, edges, sh):
     return None
 
 
-def detect_contour(small_gray, edges):
-    thresh = cv2.adaptiveThreshold(
-        small_gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        blockSize=21,
-        C=7,
-    )
+def detect_contour(red_mask_img, edges):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+    thresh = cv2.morphologyEx(red_mask_img, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -167,8 +166,9 @@ def main():
     hh = int(fh * SCALE)
 
 
-    small_gray = np.empty((hh, hw), dtype=np.uint8)
-    small_blur = np.empty_like(small_gray)
+    small_gray   = np.empty((hh, hw),    dtype=np.uint8)
+    small_blur   = np.empty_like(small_gray)
+    masked_gray  = np.empty_like(small_gray)
 
     sx, sy, sr  = 0.0, 0.0, 0.0
     tracking    = False
@@ -194,14 +194,22 @@ def main():
 
         small = cv2.resize(frame, (hw, hh), interpolation=cv2.INTER_AREA)
         cv2.cvtColor(small, cv2.COLOR_BGR2GRAY, dst=small_gray)
-        cv2.GaussianBlur(small_gray, (7, 7), 1.5, dst=small_blur)
+
+        small_hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        red_mask = cv2.bitwise_or(
+            cv2.inRange(small_hsv, RED_LOWER1, RED_UPPER1),
+            cv2.inRange(small_hsv, RED_LOWER2, RED_UPPER2),
+        )
+        cv2.bitwise_and(small_gray, small_gray, dst=masked_gray, mask=red_mask)
+
+        cv2.GaussianBlur(masked_gray, (7, 7), 1.5, dst=small_blur)
         edges = cv2.Canny(small_blur, 50, 150)
 
         result = detect_hough(small_blur, edges, hh)
         method = "hough"
 
         if result is None and (frame_num % CONTOUR_INTERVAL == 0):
-            result = detect_contour(small_gray, edges)
+            result = detect_contour(red_mask, edges)
             method = "contour"
 
         detected = False
