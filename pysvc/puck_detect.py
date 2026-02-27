@@ -2,18 +2,26 @@ import cv2
 import numpy as np
 import time
 
+# For the puck if the camera angle is on the one side, the images 
+# capture will not be able to see the entire puck. So it's no longer a circle or oval
+# 1st Propose Change: angle the camera as bird eye view to see the entire puck
+# 2nd having a angle of the puck detect and change the code thresadhold as it move 
+# to newer postion (More difficult)
+# DO NOT DELETE THESE COMMENT
 
-MIN_R = 30
-MAX_R = 60
+MIN_R = 15
+MAX_R = 25
 SCALE = 0.5
 INV_SCALE = 1.0 / SCALE
 MIN_CONFIDENCE = 0.50
 NUM_SAMPLE_PTS = 36
 
-# HSV red ranges — red wraps around 0/180 in OpenCV HSV
-RED_LOWER1 = np.array([0,   100,  60], dtype=np.uint8)
-RED_UPPER1 = np.array([10,  255, 255], dtype=np.uint8)
-RED_LOWER2 = np.array([165, 100,  60], dtype=np.uint8)
+# HSV red ranges — wider bounds to catch dark maroon puck
+# Red wraps around 0/180 in OpenCV HSV
+RED_LOWER1 = np.array([0,   40,  30], dtype=np.uint8)
+RED_UPPER1 = np.array([20,  255, 255], dtype=np.uint8)
+
+RED_LOWER2 = np.array([155, 40,  30], dtype=np.uint8)
 RED_UPPER2 = np.array([180, 255, 255], dtype=np.uint8)
 
 
@@ -41,7 +49,7 @@ def validate_circle(edges, cx, cy, cr):
     return hits / valid.sum()
 
 
-def detect_hough(small_blur, edges, sh):
+def detect_hough(small_blur, edges, sh, red_blob):
     circles = cv2.HoughCircles(
         small_blur,
         cv2.HOUGH_GRADIENT,
@@ -53,9 +61,19 @@ def detect_hough(small_blur, edges, sh):
         maxRadius=MAX_R,
     )
     if circles is not None:
+        h, w = red_blob.shape
+        fill_mask = np.zeros((h, w), dtype=np.uint8)
         for i in range(circles.shape[1]):
             x, y, r = circles[0, i]
-            conf = validate_circle(edges, int(x), int(y), int(r))
+            cx, cy, cr = int(x), int(y), int(r)
+            # Reject circles whose interior is mostly white (table arc false positive)
+            fill_mask[:] = 0
+            cv2.circle(fill_mask, (cx, cy), cr, 255, -1)
+            enclosed  = cv2.countNonZero(fill_mask)
+            actual_px = cv2.countNonZero(cv2.bitwise_and(red_blob, fill_mask))
+            if enclosed == 0 or actual_px / enclosed < 0.45:
+                continue
+            conf = validate_circle(edges, cx, cy, cr)
             if conf >= MIN_CONFIDENCE:
                 return float(x) * INV_SCALE, float(y) * INV_SCALE, float(r) * INV_SCALE, conf
     return None
@@ -73,23 +91,45 @@ def detect_contour(red_mask_img, edges):
     min_area = np.pi * MIN_R * MIN_R
     max_area = np.pi * MAX_R * MAX_R
 
+    h, w = thresh.shape
+    cmask = np.zeros((h, w), dtype=np.uint8)
+
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < min_area or area > max_area:
             continue
+
+        # Fill-ratio: puck is a solid disk; table rings are hollow outlines.
+        # Count actual red pixels inside the contour vs the enclosed area.
+        cmask[:] = 0
+        cv2.drawContours(cmask, [cnt], -1, 255, cv2.FILLED)
+        actual_px = cv2.countNonZero(cv2.bitwise_and(thresh, cmask))
+        enclosed  = cv2.countNonZero(cmask)
+        if enclosed == 0 or actual_px / enclosed < 0.45:
+            continue
+
         perim = cv2.arcLength(cnt, True)
         if perim == 0:
             continue
         circ = (4.0 * np.pi * area) / (perim * perim)
-        if circ < 0.65:
+        if circ < 0.5:
             continue
-        (cx, cy), rad = cv2.minEnclosingCircle(cnt)
+
+        # Use fitEllipse so we handle a puck viewed at a slight angle
+        if len(cnt) >= 5:
+            (cx, cy), (minor_ax, major_ax), _ = cv2.fitEllipse(cnt)
+            if major_ax == 0 or (minor_ax / major_ax) < 0.4:
+                continue          # too elongated — not a puck
+            rad = (minor_ax + major_ax) / 4.0
+        else:
+            (cx, cy), rad = cv2.minEnclosingCircle(cnt)
+
         if rad < MIN_R or rad > MAX_R:
             continue
         conf = validate_circle(edges, int(cx), int(cy), int(rad))
         if conf < MIN_CONFIDENCE:
             continue
-        score = circ * area * conf
+        score = circ * actual_px * conf
         if score > best_score:
             best_score = score
             best_conf = conf
@@ -150,7 +190,7 @@ def draw_hud(frame, fps, cx, cy, cr, tracking, detected, method, conf, fw):
 
 
 def main():
-    cap = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
+    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
     if not cap.isOpened():
         print("[ERROR] Failed to open camera")
         return
@@ -169,6 +209,9 @@ def main():
     small_gray   = np.empty((hh, hw),    dtype=np.uint8)
     small_blur   = np.empty_like(small_gray)
     masked_gray  = np.empty_like(small_gray)
+    # Morphological kernel: removes structures narrower than ~5 px (table lines)
+    # while preserving the solid puck blob
+    _open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
     sx, sy, sr  = 0.0, 0.0, 0.0
     tracking    = False
@@ -200,16 +243,18 @@ def main():
             cv2.inRange(small_hsv, RED_LOWER1, RED_UPPER1),
             cv2.inRange(small_hsv, RED_LOWER2, RED_UPPER2),
         )
-        cv2.bitwise_and(small_gray, small_gray, dst=masked_gray, mask=red_mask)
+        # Opening removes thin table-line artifacts; solid puck blob survives
+        red_blob = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, _open_k)
+        cv2.bitwise_and(small_gray, small_gray, dst=masked_gray, mask=red_blob)
 
         cv2.GaussianBlur(masked_gray, (7, 7), 1.5, dst=small_blur)
         edges = cv2.Canny(small_blur, 50, 150)
 
-        result = detect_hough(small_blur, edges, hh)
+        result = detect_hough(small_blur, edges, hh, red_blob)
         method = "hough"
 
         if result is None and (frame_num % CONTOUR_INTERVAL == 0):
-            result = detect_contour(red_mask, edges)
+            result = detect_contour(red_blob, edges)
             method = "contour"
 
         detected = False
